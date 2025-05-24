@@ -887,7 +887,13 @@ tu6_calculate_lrz_state(struct tu_cmd_buffer *cmd,
          cmd->state.lrz.disable_write_for_rp = true;
       }
 
-      if (writes_stencil_on_ds_fail)
+      /* Because the LRZ test runs first, failing the LRZ test may result in
+       * skipping the stencil test and subsequent stencil write. This is ok if
+       * stencil is only written when the depth test passes, because then the
+       * LRZ test will also pass, but if it may be written when the depth or
+       * stencil test fails then we need to disable the LRZ test for the draw.
+       */
+      if (cmd->state.stencil_written_on_depth_fail)
          temporary_disable_lrz = true;
    }
 
