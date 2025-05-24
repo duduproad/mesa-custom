@@ -6145,6 +6145,7 @@ tu6_build_depth_plane_z_mode(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    bool force_late_z = 
       (depth_format == VK_FORMAT_S8_UINT) ||
       fs->fs.lrz.force_late_z ||
+      cmd->state.lrz.force_late_z;
       /* alpha-to-coverage can behave like a discard. */
       cmd->vk.dynamic_graphics_state.ms.alpha_to_coverage_enable;
    if (cmd->state.lrz.enabled && fs->variant->writes_pos &&
