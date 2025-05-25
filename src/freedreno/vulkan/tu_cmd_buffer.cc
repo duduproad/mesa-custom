@@ -3186,9 +3186,6 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
       cmd_buffer->inherited_pipeline_statistics =
          pBeginInfo->pInheritanceInfo->pipelineStatistics;
 
-      cmd_buffer->state.occlusion_query_may_be_running =
-         pBeginInfo->pInheritanceInfo->occlusionQueryEnable;
-      
       vk_foreach_struct_const(ext, pBeginInfo->pInheritanceInfo) {
          switch (ext->sType) {
          case VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_CONDITIONAL_RENDERING_INFO_EXT: {
@@ -6013,31 +6010,6 @@ tu_emit_consts(struct tu_cmd_buffer *cmd, bool compute)
    return tu_cs_end_draw_state(&cmd->sub_cs, &cs);
 }
 
-/* Returns true if stencil may be written when depth test fails.
- * This could be either from stencil written on depth test fail itself,
- * or stencil written on the stencil test failure where subsequent depth
- * test may also fail.
- */
-static bool
-tu6_stencil_written_on_depth_fail(
-   const struct vk_stencil_test_face_state *face)
-{
-   switch (face->op.compare) {
-   case VK_COMPARE_OP_ALWAYS:
-      /* The stencil op always passes, no need to worry about failOp. */
-      return face->op.depth_fail != VK_STENCIL_OP_KEEP;
-   case VK_COMPARE_OP_NEVER:
-      /* The stencil op always fails, so failOp will always be used. */
-      return face->op.fail != VK_STENCIL_OP_KEEP;
-   default:
-      /* If the stencil test fails, depth may fail as well, so we can write
-       * stencil when the depth fails if failOp is not VK_STENCIL_OP_KEEP.
-       */
-      return face->op.fail != VK_STENCIL_OP_KEEP ||
-             face->op.depth_fail != VK_STENCIL_OP_KEEP;
-   }
-}
-
 /* Various frontends (ANGLE, zink at least) will enable stencil testing with
  * what works out to be no-op writes.  Simplify what they give us into flags
  * that LRZ can use.
@@ -6052,7 +6024,6 @@ tu6_update_simplified_stencil_state(struct tu_cmd_buffer *cmd)
    if (!stencil_test_enable) {
       cmd->state.stencil_front_write = false;
       cmd->state.stencil_back_write = false;
-      cmd->state.stencil_written_on_depth_fail = false;
       return;
    }
 
@@ -6080,11 +6051,6 @@ tu6_update_simplified_stencil_state(struct tu_cmd_buffer *cmd)
       stencil_front_op_writes && stencil_front_writemask;
    cmd->state.stencil_back_write =
       stencil_back_op_writes && stencil_back_writemask;
-   cmd->state.stencil_written_on_depth_fail =
-      (cmd->state.stencil_front_write &&
-       tu6_stencil_written_on_depth_fail(&ds->stencil.front)) ||
-      (cmd->state.stencil_back_write &&
-       tu6_stencil_written_on_depth_fail(&ds->stencil.back));
 }
 
 static bool
@@ -6131,46 +6097,32 @@ tu6_build_depth_plane_z_mode(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    const struct tu_render_pass *pass = cmd->state.pass;
    const struct tu_subpass *subpass = cmd->state.subpass;
 
-   VkFormat depth_format = VK_FORMAT_UNDEFINED;
-   if (subpass->depth_stencil_attachment.attachment != VK_ATTACHMENT_UNUSED)
-      depth_format = pass->attachments[subpass->depth_stencil_attachment.attachment].format;
-
    if ((fs->variant->has_kill ||
         (cmd->state.pipeline_feedback_loops & VK_IMAGE_ASPECT_DEPTH_BIT) ||
         (cmd->vk.dynamic_graphics_state.feedback_loops &
          VK_IMAGE_ASPECT_DEPTH_BIT) ||
         tu_fs_reads_dynamic_ds_input_attachment(cmd, fs)) &&
        (depth_write || stencil_write)) {
-      zmode = A6XX_EARLY_Z_LATE_Z;
+      zmode = (cmd->state.lrz.valid && cmd->state.lrz.enabled)
+                 ? A6XX_EARLY_LRZ_LATE_Z
+                 : A6XX_LATE_Z;
    }
 
    bool ds_test_enable = depth_test_enable || stencil_test_enable;
    bool force_late_z = 
-      (depth_format == VK_FORMAT_S8_UINT) ||
+      (subpass->depth_stencil_attachment.attachment != VK_ATTACHMENT_UNUSED &&
+       pass->attachments[subpass->depth_stencil_attachment.attachment].format
+       == VK_FORMAT_S8_UINT) ||
       fs->fs.lrz.force_late_z ||
-      cmd->state.lrz.force_late_z;
       /* alpha-to-coverage can behave like a discard. */
       cmd->vk.dynamic_graphics_state.ms.alpha_to_coverage_enable;
-   if (cmd->state.lrz.enabled && fs->variant->writes_pos &&
-       zmode == A6XX_EARLY_Z) {
-      zmode = A6XX_EARLY_Z_LATE_Z;
+   if ((force_late_z && !fs->variant->fs.early_fragment_tests) ||
+       !ds_test_enable)
+      zmode = A6XX_LATE_Z;
 
    /* User defined early tests take precedence above all else */
    if (fs->variant->fs.early_fragment_tests)
       zmode = A6XX_EARLY_Z;
-
-   /* "EARLY_Z + discard" would yield incorrect occlusion query result,
-    * since Vulkan expects occlusion query to happen after fragment shader.
-    */
-   if (zmode == A6XX_EARLY_Z && fs_kill_fragments &&
-       cmd->state.occlusion_query_may_be_running)
-      zmode = A6XX_EARLY_Z_LATE_Z;
-
-   if (zmode == A6XX_EARLY_Z_LATE_Z &&
-       (cmd->state.stencil_written_on_depth_fail || fs->fs.per_samp ||
-        !vk_format_has_depth(depth_format) || !ds_test_enable)) {
-      zmode = A6XX_LATE_Z;
-   }
 
    /* FS bypass requires early Z */
    if (cmd->state.disable_fs)
